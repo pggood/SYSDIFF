@@ -17,12 +17,107 @@
 
 namespace fs = std::filesystem;
 
+// Base64 encoding/decoding functions
+static const std::string base64_chars =
+"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+"abcdefghijklmnopqrstuvwxyz"
+"0123456789+/";
+
 // Structure to hold registry key/value information
 struct RegistryEntry {
     std::wstring value_name;
     DWORD type;
     std::vector<BYTE> data;
 };
+
+
+
+static inline bool is_base64(unsigned char c) {
+    return (isalnum(c) || (c == '+') || (c == '/'));
+}
+
+std::string base64_encode(const std::vector<BYTE>& bytes_to_encode) {
+    std::string ret;
+    int i = 0;
+    int j = 0;
+    unsigned char char_array_3[3];
+    unsigned char char_array_4[4];
+    int in_len = bytes_to_encode.size();
+    const unsigned char* bytes = bytes_to_encode.data();
+
+    while (in_len--) {
+        char_array_3[i++] = *(bytes++);
+        if (i == 3) {
+            char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+            char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+            char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+            char_array_4[3] = char_array_3[2] & 0x3f;
+
+            for (i = 0; (i < 4); i++)
+                ret += base64_chars[char_array_4[i]];
+            i = 0;
+        }
+    }
+
+    if (i) {
+        for (j = i; j < 3; j++)
+            char_array_3[j] = '\0';
+
+        char_array_4[0] = (char_array_3[0] & 0xfc) >> 2;
+        char_array_4[1] = ((char_array_3[0] & 0x03) << 4) + ((char_array_3[1] & 0xf0) >> 4);
+        char_array_4[2] = ((char_array_3[1] & 0x0f) << 2) + ((char_array_3[2] & 0xc0) >> 6);
+        char_array_4[3] = char_array_3[2] & 0x3f;
+
+        for (j = 0; (j < i + 1); j++)
+            ret += base64_chars[char_array_4[j]];
+
+        while ((i++ < 3))
+            ret += '=';
+    }
+
+    return ret;
+}
+
+std::vector<BYTE> base64_decode(const std::string& encoded_string) {
+    int in_len = encoded_string.size();
+    int i = 0;
+    int j = 0;
+    int in = 0;
+    unsigned char char_array_4[4], char_array_3[3];
+    std::vector<BYTE> ret;
+
+    while (in_len-- && (encoded_string[in] != '=') && is_base64(encoded_string[in])) {
+        char_array_4[i++] = encoded_string[in]; in++;
+        if (i == 4) {
+            for (i = 0; i < 4; i++)
+                char_array_4[i] = base64_chars.find(char_array_4[i]);
+
+            char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+            char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+            char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+
+            for (i = 0; (i < 3); i++)
+                ret.push_back(char_array_3[i]);
+            i = 0;
+        }
+    }
+
+    if (i) {
+        for (j = i; j < 4; j++)
+            char_array_4[j] = 0;
+
+        for (j = 0; j < 4; j++)
+            char_array_4[j] = base64_chars.find(char_array_4[j]);
+
+        char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
+        char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
+        char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
+
+        for (j = 0; (j < i - 1); j++) ret.push_back(char_array_3[j]);
+    }
+
+    return ret;
+}
 
 // Function to compute MD5 checksum of a file
 std::string computeMD5(const std::string& filePath) {
@@ -179,9 +274,10 @@ int main(int argc, char* argv[]) {
         std::map<std::wstring, RegistryEntry> reg_snap;
         captureRegistrySnapshot(HKEY_LOCAL_MACHINE, L"", reg_snap, L"HKLM");
         for (auto& [key, entry] : reg_snap) {
+            std::string encoded_data = base64_encode(entry.data); // Convert binary to Base64
             out << "REG|" << std::string(key.begin(), key.end()) << "|"
                 << entry.type << "|"
-                << std::string(entry.data.begin(), entry.data.end()) << "\n";  // simplistic
+                << encoded_data << "\n";
         }
 
         out.close();
@@ -214,8 +310,18 @@ int main(int argc, char* argv[]) {
                 fs_snap_before[path] = hash;
             }
             else if (line.rfind("REG|", 0) == 0) {
-                // Simplified parser — ideally base64 or hex encode REG data
-                // Not production safe as-is
+                auto delim1 = line.find('|', 4);          // After "REG|"
+                auto delim2 = line.find('|', delim1 + 1); // After key
+                std::string key_str = line.substr(4, delim1 - 4);
+                std::wstring key(key_str.begin(), key_str.end());
+                DWORD type = std::stoul(line.substr(delim1 + 1, delim2 - delim1 - 1));
+                std::string encoded_data = line.substr(delim2 + 1);
+                std::vector<BYTE> data = base64_decode(encoded_data); // Decode back to binary
+                RegistryEntry entry;
+                entry.value_name = L""; // Adjust if value_name is separate in key
+                entry.type = type;
+                entry.data = data;
+                reg_snap_before[key] = entry;
             }
         }
 
@@ -253,3 +359,4 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+
