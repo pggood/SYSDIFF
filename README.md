@@ -12,7 +12,7 @@ A modern C++ reimplementation of Microsoft's legacy `sysdiff.exe` from the Windo
 - 📝 Planned: Generate `.INF` deployment scripts
 - 💾 MD5-based file integrity checking
 - 🗂 Recursive directory traversal
-- 🧠 Minimal, efficient logic in C++17
+- 🧠 Minimal, efficient logic in C++20 using Visual Studio 2020 
 - 🖥 Supports Windows 10 and 11
 
 ---
