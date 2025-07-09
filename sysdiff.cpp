@@ -245,7 +245,214 @@ void captureRegistrySnapshot(HKEY rootHive, const std::wstring& subKey, std::map
 
     RegCloseKey(hOpenedKey);
 }
+// INF file generation structures and functions
+struct INFGenerator {
+    std::ofstream inf_file;
+    std::string inf_filename;
+    std::string output_dir;
 
+    INFGenerator(const std::string& diff_file, const std::string& output_directory)
+        : output_dir(output_directory) {
+        // Generate INF filename based on diff file name
+        std::filesystem::path diff_path(diff_file);
+        std::string base_name = diff_path.stem().string();
+        inf_filename = output_directory + "\\" + base_name + ".inf";
+    }
+
+    bool Initialize() {
+        inf_file.open(inf_filename);
+        if (!inf_file.is_open()) {
+            return false;
+        }
+
+        // Write INF header
+        inf_file << "[Version]\n";
+        inf_file << "Signature=\"$CHICAGO$\"\n";
+        inf_file << "Class=System\n";
+        inf_file << "ClassGUID={4D36E97D-E325-11CE-BFC1-08002BE10318}\n";
+        inf_file << "Provider=SysDiff\n";
+        inf_file << "DriverVer=" << GetCurrentDateString() << "\n";
+        inf_file << "\n";
+
+        inf_file << "[DefaultInstall]\n";
+        inf_file << "AddReg=Registry.Add\n";
+        inf_file << "DelReg=Registry.Delete\n";
+        inf_file << "CopyFiles=Files.Copy\n";
+        inf_file << "DelFiles=Files.Delete\n";
+        inf_file << "\n";
+
+        inf_file << "[Registry.Add]\n";
+        return true;
+    }
+
+    void WriteRegistryAdd(const std::string& key, const std::string& value_name,
+        DWORD type, const std::vector<BYTE>& data) {
+        inf_file << "\"" << key << "\",\"" << value_name << "\",";
+
+        // Convert registry type to INF format
+        switch (type) {
+        case REG_SZ:
+            inf_file << "0x00000000,\"" << BytesToString(data) << "\"\n";
+            break;
+        case REG_DWORD:
+            if (data.size() >= 4) {
+                DWORD value = *reinterpret_cast<const DWORD*>(data.data());
+                inf_file << "0x00010001,0x" << std::hex << value << std::dec << "\n";
+            }
+            break;
+        case REG_BINARY:
+            inf_file << "0x00000001,";
+            for (size_t i = 0; i < data.size(); ++i) {
+                if (i > 0) inf_file << ",";
+                inf_file << "0x" << std::hex << std::setw(2) << std::setfill('0')
+                    << static_cast<int>(data[i]) << std::dec;
+            }
+            inf_file << "\n";
+            break;
+        default:
+            inf_file << "0x00000000,\"" << BytesToString(data) << "\"\n";
+            break;
+        }
+    }
+
+    void WriteRegistryDelete(const std::string& key, const std::string& value_name) {
+        inf_file << "\"" << key << "\",\"" << value_name << "\"\n";
+    }
+
+    void WriteFileAdd(const std::string& filepath) {
+        std::filesystem::path path(filepath);
+        std::string filename = path.filename().string();
+        std::string directory = path.parent_path().string();
+
+        inf_file << filename << ",,,0x00000000\n";
+    }
+
+    void WriteFileDelete(const std::string& filepath) {
+        std::filesystem::path path(filepath);
+        std::string filename = path.filename().string();
+        inf_file << filename << "\n";
+    }
+
+    void StartSection(const std::string& section_name) {
+        inf_file << "\n[" << section_name << "]\n";
+    }
+
+    void Close() {
+        if (inf_file.is_open()) {
+            inf_file.close();
+        }
+    }
+
+private:
+    std::string BytesToString(const std::vector<BYTE>& data) {
+        return std::string(data.begin(), data.end());
+    }
+
+    std::string GetCurrentDateString() {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm tm;
+        localtime_s(&tm, &time_t);
+
+        std::ostringstream oss;
+        oss << std::put_time(&tm, "%m/%d/%Y");
+        return oss.str();
+    }
+};
+
+// Function to generate INF file from diff file
+DWORD GenerateINFFromDiff(const std::string& diff_file, const std::string& output_dir) {
+    std::ifstream in(diff_file);
+    if (!in.is_open()) {
+        std::cerr << "Cannot read diff file: " << diff_file << "\n";
+        return ERROR_FILE_NOT_FOUND;
+    }
+
+    // Create output directory if it doesn't exist
+    if (!std::filesystem::exists(output_dir)) {
+        if (!std::filesystem::create_directories(output_dir)) {
+            std::cerr << "Cannot create output directory: " << output_dir << "\n";
+            return ERROR_PATH_NOT_FOUND;
+        }
+    }
+
+    INFGenerator inf_gen(diff_file, output_dir);
+    if (!inf_gen.Initialize()) {
+        std::cerr << "Cannot create INF file\n";
+        return ERROR_FILE_NOT_FOUND;
+    }
+
+    // Parse diff file and generate INF sections
+    std::string line;
+    bool in_registry_section = true;
+    bool in_files_section = false;
+
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+
+        if (line.rfind("ADD|", 0) == 0) {
+            std::string path = line.substr(4);
+
+            if (in_files_section) {
+                inf_gen.WriteFileAdd(path);
+            }
+        }
+        else if (line.rfind("MOD|", 0) == 0) {
+            std::string path = line.substr(4);
+
+            if (in_files_section) {
+                inf_gen.WriteFileAdd(path);  // Modified files treated as adds
+            }
+        }
+        else if (line.rfind("DEL|", 0) == 0) {
+            std::string path = line.substr(4);
+
+            if (in_files_section) {
+                if (!in_files_section) {
+                    inf_gen.StartSection("Files.Delete");
+                    in_files_section = true;
+                }
+                inf_gen.WriteFileDelete(path);
+            }
+        }
+        else if (line.rfind("REG|", 0) == 0) {
+            // Parse registry entry
+            auto delim1 = line.find('|', 4);
+            auto delim2 = line.find('|', delim1 + 1);
+
+            if (delim1 != std::string::npos && delim2 != std::string::npos) {
+                std::string key = line.substr(4, delim1 - 4);
+                std::string type_str = line.substr(delim1 + 1, delim2 - delim1 - 1);
+                std::string data_str = line.substr(delim2 + 1);
+
+                DWORD type = std::stoul(type_str);
+                std::vector<BYTE> data = base64_decode(data_str);
+
+                // Extract value name from key (assuming format: HKLM\Path\ValueName)
+                size_t last_backslash = key.find_last_of('\\');
+                std::string reg_key = key.substr(0, last_backslash);
+                std::string value_name = key.substr(last_backslash + 1);
+
+                inf_gen.WriteRegistryAdd(reg_key, value_name, type, data);
+            }
+        }
+
+        // Switch to files section when we encounter file operations
+        if (line.rfind("ADD|", 0) == 0 || line.rfind("MOD|", 0) == 0 || line.rfind("DEL|", 0) == 0) {
+            if (in_registry_section) {
+                inf_gen.StartSection("Registry.Delete");
+                inf_gen.StartSection("Files.Copy");
+                in_registry_section = false;
+                in_files_section = true;
+            }
+        }
+    }
+
+    inf_gen.Close();
+
+    std::cout << "INF file generated: " << inf_gen.inf_filename << "\n";
+    return NO_ERROR;
+}
 // Main function
 int main(int argc, char* argv[]) {
     if (argc < 3) {
@@ -349,8 +556,21 @@ int main(int argc, char* argv[]) {
         std::cout << "Diff saved to " << diff_file << "\n";
     }
     else if (mode == "/inf") {
-        std::cerr << "INF generation not implemented (yet)\n";
-        return 1;
+        if (argc < 4) {
+            std::cerr << "Missing parameters for /inf\n";
+            return 1;
+        }
+
+        std::string diff_file = argv[2];
+        std::string output_dir = argv[3];
+
+        DWORD result = GenerateINFFromDiff(diff_file, output_dir);
+        if (result != NO_ERROR) {
+            std::cerr << "INF generation failed with error: " << result << "\n";
+            return 1;
+        }
+
+        std::cout << "INF generation completed successfully\n";
     }
     else {
         std::cerr << "Unknown mode: " << mode << "\n";
@@ -359,4 +579,5 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+
 
